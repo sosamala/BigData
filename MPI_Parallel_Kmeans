@@ -1,0 +1,804 @@
+/** @file group_1.c
+ *  @brief Kmeans implementation
+ *
+ *  This contains the required implemented
+ *  methods for Big Data Assigment 3 
+ *
+ *  @authors James Ballari,Soundarya Samala 
+ *  @bug No known bug.
+ */
+
+/*
+** How to run! **
+================================
+$ sudo apt install mpich
+$ mpicc ParallelKmeans.c -o run -lm
+$ mpirun -np 5  ./run
+*/
+
+#include<stdio.h>
+#include<stdlib.h>
+#include<math.h>
+#include<string.h>
+#include<float.h>
+#include<time.h>
+#include<stdbool.h>
+#include <string.h>
+#include <mpi.h>
+#define DEBUG 1
+#define LOG 1
+
+
+
+/** @brief Calculates the euclidean distance
+ *
+ * Given two poionts 'pt1' and 'pt2' of dimensions 'dim'
+ * this method calculates the euclidean distance.
+ *
+ * @return the euclidean distance
+ */
+double euclidean_distance(double * pt1, double * pt2, int dim){
+
+    double sum = 0;
+    for(int i = 0 ; i < dim ; i++){
+        sum += pow( (pt1[i] - pt2[i]), 2);
+    }
+    return sqrt(sum);
+
+}
+
+/** @brief returns k initial centers for the K-means
+ *
+ * Selects k centers which are equally far away from 
+ * each other.
+ *
+ * @return the number of centers
+ */
+int initial_centers(int dim, int i0, int im, double *data, int k, 
+                    double *cluster_centroid, MPI_Comm comm) {
+    
+    // 1. Select Cluster Center points from datum
+    // 1.1 Choose inital cluster center.
+    int ndata = im - i0 + 1;
+    int cluster_center_points[k];
+    bool cluster_selected_points[ndata];
+    for(int i=0;i<ndata;i++) cluster_selected_points[i] = false;
+    
+    cluster_center_points[0] = (int)(rand() % ndata);
+    cluster_selected_points[cluster_center_points[0]] = true;
+    
+    if(DEBUG) printf("\nFirst point is %d, i0 = %d \n",cluster_center_points[0], i0 );
+    if(k == 1) return k;
+    
+    // 1.2 choosing farthest point from 1st selected cluster.
+    double max_distance = -1;
+    for(int i=0;i<ndata;i++) {
+        if(!cluster_selected_points[i]) {
+            double distance 
+                = euclidean_distance(
+                    &data[(i0+cluster_center_points[0])*dim],
+                    &data[(i0+i)*dim],
+                    dim);
+            if(distance > max_distance) {
+                max_distance = distance;
+                cluster_center_points[1] = i;
+                if(DEBUG) printf("max distance  = %lf\n", distance);
+            }
+        }
+    }
+    cluster_selected_points[cluster_center_points[1]] = true;
+    if(DEBUG) printf("Second point is %d \n",cluster_center_points[1] );
+    if(k == 2) return k;
+    
+    // 1.3 choosing the rest of the cluster centers 
+    int j =2;
+    while(j<k) {
+        max_distance = -1;
+        for(int i=0;i<ndata;i++) {
+            if(!cluster_selected_points[i]) {
+                double min_distance = DBL_MAX;
+                for(int k=0; k<j; k++) {
+                    double distance = euclidean_distance(
+                    &data[(i0+cluster_center_points[k])*dim],
+                    &data[(i0+i)*dim],
+                    dim);
+                    if(distance < min_distance) {
+                        min_distance = distance;
+                    }
+                }
+                if(min_distance > max_distance) {
+                    cluster_center_points[j] = i;
+                    max_distance = min_distance;
+                }
+            }
+        }
+        cluster_selected_points[cluster_center_points[j]] = true;
+        j++;
+    }
+    
+    // 1.4 updating the cluster centeriod accordingly.
+    for(int i=0;i<k;i++) {
+        int centroid_point_index = cluster_center_points[i];
+        for(int j=0;j<dim;j++) {
+            cluster_centroid[i*dim+j] = data[(i0+centroid_point_index) * dim + j];
+        }
+    }
+    
+    // 1.5 Printing all the selected cluster centers.
+    if(LOG) {
+        printf("\nSlected Cluster center points are : \n");
+        for(int i=0;i<k;i++) {
+            printf("%d. %d -> ", i+1, cluster_center_points[i]);
+            for(int j=0;j<dim;j++) {
+                
+                
+                printf("%0.0lf, ", cluster_centroid[i*dim+j]);
+            }
+            printf("\n");
+        }
+    }
+    
+    return k;
+    
+}
+
+
+
+/** @brief Cretes the KMeans Clusters
+ *
+ * Creates KMeans Clusters for 'ndata' number of points
+ * with 'dim' dimensions whose data is found in 'data'.
+ * creates 'k' no. of clusters, where each cluster is of 
+ * 'cluster_size[i]' size starting from 'cluster_start[i]'
+ * position in 'cluster_assign', where the centroid of each
+ * cluster is in 'cluster_centroid' and 
+ * cluster radius is in 'cluster_radius'.
+ *
+ * @return no return values.
+ */
+/********************************************************************
+ Array Sizes:
+ cluster_centroid[k*dim]: input -- stores initial k cluster centers
+                          output-- stores final k cluster centers
+
+ cluster_radius[k]:output
+                   Stores the radius of each output cluster
+
+ cluster_start[k]: output
+                   Stores the index of each cluster's starting datum
+
+ cluster_size[k]:  output
+                   Stores the num of data points in each cluster
+
+ cluster_assign[ndata]: buffer that stores the membership of data 
+*********************************************************************/
+int kmeans(int dim, int i0, int im, double *data, int k, 
+           int *cluster_start, int *cluster_size,
+           double *cluster_radius, double *cluster_centroid,
+           short *cluster_assign, MPI_Comm comm)   {
+    
+    if(i0 == im && im == -1) return -1;
+    
+    int ndata = im-i0+1;
+    // 1. initial_centers
+    k = initial_centers(dim, i0, im, data, k, 
+                    cluster_centroid, comm);
+  
+    // 2. K means Algorithm.
+    bool stop_iteration = false;
+    int max_tries = ndata*k, tries = 0;
+    printf("\nK means clustering Starts\n");
+    while(!stop_iteration && tries  < max_tries) {
+        
+        int count_cluster_change = 0;
+        printf("*******************************************");
+        printf("\nTries = %d\n", tries+1);
+        // setting cluster size to zero.
+        for( int i=0;i<k;i++) {
+            cluster_size[i] = 0;
+        }
+        if(LOG) printf("\nChanges = ");
+        for(int i=0;i<ndata;i++) {
+            int old_cluster = cluster_assign[i];
+            int new_cluster = -2;
+            double min_distance = DBL_MAX;
+            
+            for(int j=0;j<k;j++) {
+                double distance = euclidean_distance(
+                    &cluster_centroid[j*dim],
+                    &data[(i0+i)*dim],
+                    dim);
+                if(distance < min_distance) {
+                    min_distance = distance;
+                    new_cluster = j;
+                }
+            }
+            if(old_cluster != new_cluster) {
+                count_cluster_change++;
+                if(LOG) printf("[%d:%d->%d],",i,old_cluster,new_cluster);
+                
+            }
+            cluster_assign[i] = new_cluster;
+            cluster_size[new_cluster]++;
+        }
+        
+        // calculate centroid of each cluster.
+        for(int i=0;i<k;i++) {
+            for(int j=0;j<dim;j++) {
+                cluster_centroid[i*dim+j] = 0;
+            }
+        }
+        if(LOG) printf("\n\nCluster Assign = ");
+        for(int i=0;i<ndata;i++) {
+            if(LOG) {
+            printf("(%d -> %d),",i, cluster_assign[i]);
+            }
+            for(int j=0;j<dim;j++) {
+                cluster_centroid[cluster_assign[i]*dim+j] += 
+                    data[(i0+i)*dim + j];
+            }
+        }
+        if(LOG) printf("\n");
+        
+        
+        for(int i=0;i<k;i++) {
+            for(int j=0;j<dim;j++) {
+                cluster_centroid[i*dim+j] /= cluster_size[i];
+            }
+        }
+        
+        if(LOG) {
+            printf("\nCluster Centroids: \n");
+            for(int i=0;i<k;i++) {
+                printf("%d. ", i+1);
+                for(int j=0;j<dim;j++) {
+                    printf("%0.4lf, " , cluster_centroid[i*dim+j] );
+                }
+                printf("\n");
+            }
+        
+        }
+        
+        // break conditions
+        if(count_cluster_change == 0) stop_iteration = true;
+        tries++;
+    }
+    
+    // 3. Populate cluster start, re-arrage data, find radius.
+    
+    // 3.1 Populate cluster start from cluster size.
+    cluster_start[0] = i0;
+    for(int i=1;i<k;i++) {
+        cluster_start[i] = cluster_start[i-1]+cluster_size[i-1];
+    }
+    
+    if(LOG) {
+        printf("\nCluster start and Cluster Size is\n");
+        for(int i=0;i<k;i++) {
+             printf("(%d, %d), ", cluster_start[i], cluster_size[i]);
+        }
+        printf("\n");
+    }
+    
+  
+    
+    // 3.2 move points according to their cluster position
+    double tempPoints[ndata*dim];
+    double cluster_fill_size[k];
+    memset(cluster_fill_size,0, sizeof(cluster_fill_size));
+    memset(tempPoints,0, sizeof(tempPoints));
+    printf("Test points after moving\n");
+    for(int i=0;i<ndata;i++) {
+        int cluster = cluster_assign[i];
+        int position = cluster_start[cluster]+cluster_fill_size[cluster]-i0;
+        for(int j=0;j<dim;j++) {
+            tempPoints[position*dim+j] = data[dim*(i+i0)+j];
+            printf(" %d-%0.2lf ", position*dim+j,data[dim*(i+i0)+j]);
+        }
+        printf("\n");
+        cluster_fill_size[cluster]+= 1;
+        
+    }
+
+    if(DEBUG) printf("\n Points are: \n");
+    for(int i=0;i<ndata*dim;i++) {
+            data[i+i0] = tempPoints[i];
+            if(DEBUG) {
+                if(i%dim ==0) printf("\n");
+                printf("%0.2lf, ",data[i0+i]);
+                }
+    }
+    
+    // 3.3 Calculate Cluster Radius.
+    // Distance from the Centroid to the Farthest Point in the Cluster
+    for (int i=0;i<k;i++) {
+        int clu_start = cluster_start[i];
+        int clu_end = cluster_start[i] + cluster_size[i] - 1;
+        cluster_radius[i] = 0;
+        for(int j=clu_start;j<=clu_end;j++) {
+            double distance = euclidean_distance(
+                &cluster_centroid[i*dim], 
+                &data[(i0+j)*dim], 
+                dim);
+            if(distance > cluster_radius[i]) {
+                cluster_radius[i] = distance;
+            }
+        } 
+    }
+    
+    if(LOG) {
+        printf("\n\nCluster Radius:\n");
+        for(int i=0;i<k;i++) 
+            printf("%d) %lf\n",i+1, cluster_radius[i]);
+    }
+    
+    return k;
+    
+}
+
+
+/** @brief Calculates the minimum
+ *
+ * Given two values 'a' and 'b'
+ *
+ * @return the minimum of a and b
+ */
+double min(double a, double b){
+    return a<b ? a : b;
+}
+
+/** @brief Perform exhaustive search on a cluster.
+ *
+ * Given a 'cluster' index,  'cluster_start[cluster]' 
+ * and 'cluster_size[cluster]' indexing the 
+ * points in 'data' points with 'dim' dimensions, performs an exhaustive 
+ * search of all points to find the minimum distance points.
+ *
+ * @return the minimum distance and update the result_pt
+ */
+double search_cluster(
+    int cluster, int dim, double *data, int * cluster_start,
+    int * cluster_size,double 
+    *query_pt, double *result_pt){
+    
+        double nearest_distance = DBL_MAX;
+        int current_cluster_size = cluster_size[cluster];
+        int current_cluster_start = cluster_start[cluster];
+    
+        for(int i = 0; i < current_cluster_size; i++){
+
+            double * curr_pt 
+                =  &data[(current_cluster_start+i)*dim];
+            double distance 
+                = euclidean_distance(query_pt, curr_pt, dim);
+                
+            if(DEBUG) {
+                printf("\nDistance: %lf  %lf\n", distance,
+                nearest_distance);
+            }
+            //nearest_distance = min(nearest_distance, distance);
+            if(distance < nearest_distance){
+                nearest_distance = distance;
+                for(int l=0; l < dim ;l++){
+                    result_pt[l] = curr_pt[l];
+                    if(DEBUG) {
+                        printf("%lf ", curr_pt[l]);
+                    }
+                }
+                if(DEBUG) {printf("\n");}
+                
+            }
+        }
+        if(DEBUG) {
+                printf("\nNearest Distance: %lf\n", nearest_distance);
+        }
+        return nearest_distance;
+}
+
+/** @brief search for the nearest point using clusters of KMeans.
+ *
+ * Given 'ndata' number of data points, each with 'dim' dimensions, 
+ * search for 'query_pt', using 'k' clusters of KMeans with
+ * corresponding 'cluster_start', 'cluster_size', 'cluster_centroid'
+ * and cluster_radius.
+ * 
+ * The Search has two steps. 
+ *   1. find the cluster with the closest centroid, perform exhaustive
+ *      search to find the closet point in the centroid, call it dmin.
+ *   2. if dmin ==0 we have the search point else
+ *        for each cluster 
+ *          calcuate if dmin > (distance to centroid - Radius of the cluster)
+ *          then perform exhaustive serach in that cluster calcuate new_d_min.
+ *           if new_d_min is less than dmin, update dmin = new_d_min. 
+ *                                          and update result point.
+ * @return no return value, updates result_pt. */
+/***************************************************************
+ * search_kmeans() returns the number of data points checked   *
+ * query_pt[dim]:  input, the query point                      *
+ * result_pt[dim]: output, the closest data point to the query *
+ ***************************************************************/
+
+int search_kmeans(int dim, int ndata, double *data, int k,
+           int *cluster_start, int *cluster_size, 
+           double *cluster_radius, double *cluster_centroid,
+           double *query_pt, double *result_pt, MPI_Comm comm ) {
+    
+    int is_result = 0;
+    double nearest_distance = DBL_MAX ;
+    double nearest_pt[dim];
+
+        
+    // search in the cluster with the closest centroid to query point.
+
+    double nearest_ctr_dist = DBL_MAX ;
+    int nearest_ctr[k];
+    int nearest_ctr_size = 0;
+    bool checkedclusters[k];
+    for(int i=0;i<k;i++) checkedclusters[i] = false;
+    
+    //int nearest_ctr = -1;
+    double dist_qp_ctr[k];
+    for(int cltr = 0; cltr < k; cltr++) {
+        double *centroid = &cluster_centroid[cltr*dim];
+        dist_qp_ctr[cltr] = euclidean_distance(query_pt, centroid, dim);
+        if(DEBUG) {
+            printf("\nQuery Point\n");
+            for(int i = 0; i<  dim ; i++){
+                printf("%lf, ",centroid[i]);
+            }
+        }
+        //nearest_ctr_dist = min(distance,nearest_ctr_dist);
+        if(dist_qp_ctr[cltr] < nearest_ctr_dist ) {
+            nearest_ctr_size = 1;
+            nearest_ctr[0] = cltr;
+            nearest_ctr_dist = dist_qp_ctr[cltr];
+        } else if(dist_qp_ctr[cltr] == nearest_ctr_dist ) {
+             nearest_ctr[nearest_ctr_size++] = cltr;
+        } 
+    }
+
+    if(LOG) {
+        printf("\nNearest Cluster Distance is : %lf,\nNearest Clusters are: ", nearest_ctr_dist);
+        for(int i=0;i<nearest_ctr_size;i++){
+            printf("%d, ", nearest_ctr[i]);
+        }
+        printf("\n");
+    }
+    
+    double nearest_distance_temp = DBL_MAX;
+    double d_min;
+    int nearest_cluster_index = 0;
+    for(int i=0;i<nearest_ctr_size;i++){
+        printf("\nSearching in Cluster = %d for the closest point.\n", nearest_ctr[i]);
+         checkedclusters[nearest_ctr[i]] = true;
+         d_min = search_cluster(nearest_ctr[i], dim, data,cluster_start,
+            cluster_size,query_pt,nearest_pt);
+        printf("Nearest Point is : ");
+        for(int j=0;j<dim;j++){
+            printf("%lf, ", nearest_pt[j] );
+        }
+        printf("\nDistance form Query point is %lf\n", d_min);
+        if(d_min < nearest_distance_temp) {
+            nearest_distance_temp = d_min;
+            for(int j = 0; j < dim ; j++){
+                    result_pt[j] = nearest_pt[j];
+            }
+            nearest_cluster_index = i;
+            
+        }
+    }
+    
+    d_min = nearest_distance_temp;
+    
+    printf("\nD_min %lf\n",d_min); 
+    if(d_min == 0.0) 
+        return 0;
+    printf("\nChecking Other clusters for possible nearest point.\n");
+    
+    for(int cltr = 0; cltr < k; cltr++) {
+        printf("*************************************************************");
+        if(checkedclusters[cltr]) {
+            printf("\nSkipping Cluster %d, as its been already searched.\n", cltr);
+            continue;
+        }
+        printf("\nCluster=%d \n\t Cluster Radius=%lf, "
+               "\n\t Distance from Query point to Cluster Centroid = %lf"
+               "\n\t Current Minimum Distance = %lf",
+               cltr,cluster_radius[cltr],dist_qp_ctr[cltr], d_min ); 
+        if(d_min > (dist_qp_ctr[cltr] - cluster_radius[cltr])) {
+            printf("\n\n\t Searching cluster %d for possible nearest point",cltr);
+            double new_d_min = search_cluster(cltr, dim, data,cluster_start,
+            cluster_size,query_pt,nearest_pt);
+            printf("\n\t Closest Point is %lf away", new_d_min);
+            printf("\n\t Closest Point is : ");
+            for(int j=0;j<dim;j++){
+                printf("%lf, ", nearest_pt[j] );
+            }
+            printf("\n");
+            if(new_d_min < d_min){
+                for(int i = 0; i < dim ; i++){
+                    result_pt[i] = nearest_pt[i];
+                }
+                d_min = new_d_min;
+                printf("\nNew D_min value %lf in cluster %d",d_min,cltr);
+            }          
+        } else {
+            printf("\n\t Unlikely for a Nearest Point to be in this cluster.");
+        }
+        printf("\n");
+          
+    }
+    
+    
+    return is_result;
+}
+
+
+int getSizeofProcessorData(int ndata, int np, int pid){
+    
+    int thread_ndata = 0;
+    if(ndata <= np) {
+        thread_ndata = 1;
+        if(pid + 1 < ndata) {
+            thread_ndata = 0;
+        }
+    } else {
+        int dist_points = ndata/np;
+        if(ndata%np != 0) {
+            thread_ndata = dist_points + 1;
+        } else {
+            thread_ndata = dist_points;
+        }
+    }
+    return thread_ndata;
+}
+
+/** @brief The main method.
+ *
+ * calls the KMeans method and search_kmeans method with
+ * the required data.
+ *
+ * @return 0
+ */
+int main(int argc, char *argv[]) {
+    
+    srand(0); // same seed.
+    int dim = 4;
+    int ndata = 33;
+        
+    int k = 3;
+    
+    const int baseProcessId = 0;   
+    int pid, np;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &np);
+    MPI_Comm_rank(MPI_COMM_WORLD, &pid);
+    
+    if(pid==baseProcessId) {
+        printf("\n********************************************\n");
+        printf("Final Result is in the file output_0.txt\n");
+        printf("********************************************\n");
+    }
+    
+    char output_file[100];
+    sprintf(output_file, "output_%d.txt", pid);
+    freopen (output_file,"w",stdout);
+    
+    const int max_space_size = (getSizeofProcessorData(ndata,np,0)+2) * dim;
+    //double *pdata = (double *) malloc(tndata * dim * sizeof(double));;
+    double pdata[max_space_size];
+    double temp_pdata[max_space_size];
+    int i0, im, tndata;
+
+    if(pid == baseProcessId){   
+        double data[] = { 
+            -3, 2, 0, 4, 
+            -1, -1, -3, 0, 
+            0, -3, 4, 1, 
+            -1, 0, 0, -3, 
+            1, 2, 0, 1, 
+
+            2, -3, -4, 4, 
+            -1, 2, 1, 1, 
+            0, -3, -2, -4, 
+            3, 1, -3, 1, 
+            0, -2, 3, -4, 
+
+            -4, 0, 0, 0, 
+            -4, 0, 1, 0, 
+            1, 0, 4, -1, 
+            0, -4, 0, -3, 
+            0, -2, 1, 0, 
+
+            -2, -1, -1, 0, 
+            4, -3, -1, -3, 
+            4, -1, 2, 0, 
+            3, -2, 0, 0, 
+            4, -2, 4, 4, 
+
+            2, -2, -4, -1, 
+            4, 3, -2, 0, 
+            1, 1, -1, 0, 
+            -4, -2, 0, -1, 
+            1, -2, -4, 3, 
+
+            2, -1, 0, 2, 
+            0, -3, 0, -3, 
+            -1, -3, 3, 4, 
+            3, 4, -1, 2, 
+            4, -3, -1, 1, 
+
+            -4, -3, 3, 4, 
+            -2, -2, -2, 0, 
+            4, 3, -3, -3
+        };  
+        
+        // assign data to this process.
+        tndata = getSizeofProcessorData(ndata,np,baseProcessId);
+        //pdata = (double *) malloc(tndata * sizeof(double));
+        for(int i=0;i<tndata*dim;i++) {
+            pdata[i] = data[i];
+        }
+        
+        i0 = 0;
+        im = tndata-1;
+        // send data to other processes.
+        for(int currPid =1; currPid < np;currPid++){
+            
+            int temp_tndata = getSizeofProcessorData(ndata,np,currPid); 
+            printf("getSizeofProcessorData(%d,%d,%d) = %d\n", ndata, np, currPid, temp_tndata );
+            // total number of data points the current thread will process. 
+            int temp_i0 = temp_tndata * currPid; // the starting index that the current thread will process.
+            int temp_im = (temp_tndata * (currPid+1)) -1;
+            if (temp_i0 < ndata && temp_im >= ndata) {
+                temp_im = ndata-1;
+            }
+            if(temp_i0 >= ndata ) {
+                temp_i0 = -1;
+                temp_im = -1;
+            }
+            if(temp_i0 == im && temp_im == -1) {
+                temp_tndata = 0;
+            } else {
+                temp_tndata = temp_im-temp_i0+1;
+            }
+            printf("sending pid=%d size of %d from %d to %d\n",currPid, temp_tndata,temp_i0,temp_im);
+            //double *temp_pdata = NULL;
+            //if(currPid == 1)
+            //    temp_pdata = (double *) malloc(temp_tndata * dim * sizeof(double));
+            //else
+            //    temp_pdata = (double *) realloc(temp_pdata, temp_tndata * dim * sizeof(double));
+            for(int i = 0; i < temp_tndata*dim; i++){
+                temp_pdata[i] =  data[i+temp_i0*dim];           
+            }
+            MPI_Send(temp_pdata, max_space_size, MPI_DOUBLE, currPid, 1, MPI_COMM_WORLD);
+            //free(temp_pdata);
+        }
+    } else {
+        
+        int temp_tndata = getSizeofProcessorData(ndata,np,pid); 
+        printf("temp_tndata= %d\n",temp_tndata);
+        i0 = temp_tndata * pid; // the starting index that the current thread will process.
+        im = (temp_tndata * (pid+1)) -1;
+        if (i0 < ndata && im >= ndata) {
+            im = ndata-1;
+        }
+        if(i0 >= ndata ) {
+            i0 = -1;
+            im = -1;
+        }
+        if(i0 == im && im == -1) {
+            tndata = 0;
+        } else {
+            tndata = im-i0+1;
+        }
+        i0 = 0;
+        im = tndata-1;
+        printf("Malloc size tndata %d\n",tndata);
+        //pdata = (double *) malloc(tndata * dim * sizeof(double));
+        MPI_Recv(pdata, max_space_size, MPI_DOUBLE, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+    
+    
+    printf("pid = %d, np = %d, i0 = %d, im = %d, tndata = %d\n", pid, np, i0, im, tndata);
+    for(int i=0;i<tndata*dim;i++) {
+        if(i%dim==0) printf("\n");
+        printf("%lf ",pdata[i]);
+    }
+    printf("\n");
+    
+    
+    int cluster_start[k];
+    int cluster_size[k];
+    
+    double cluster_radius[k];
+    double cluster_centroid[k*dim];
+    short cluster_assign[tndata];
+    
+    // defaulting all the values
+    memset(cluster_start,-1, sizeof(cluster_start));
+    memset(cluster_size,-1, sizeof(cluster_size));
+    memset(cluster_radius,0, sizeof(cluster_radius));
+    memset(cluster_centroid,0, sizeof(cluster_centroid));
+    memset(cluster_assign,-1, sizeof(cluster_assign));
+    
+    // Call Kmeans method.
+    
+    //int i0 = 0 ;
+    //int im = ndata-1;
+    
+    kmeans(dim, i0, im, pdata, k,
+           cluster_start, cluster_size,
+           cluster_radius, cluster_centroid,
+           cluster_assign, MPI_COMM_WORLD);
+    
+
+    //double query_pt[] = {3,2,4};
+    //double query_pt[] = {-4,3,-1,2};
+    double query_pt[] = {50,-1,5,-23};
+    //double query_pt[] = {5,2,1};
+    double result_pt[dim];
+    
+    if(LOG) {
+        printf("\nQuery Point\n");
+        for(int i = 0; i<  dim ; i++){
+            printf("%lf ",query_pt[i]);
+        }
+    
+    }
+    //
+    
+    //call search kdtree method.
+    int a = search_kmeans(dim, tndata, pdata, k,
+          cluster_start, cluster_size, cluster_radius,cluster_centroid,
+          query_pt, result_pt,MPI_COMM_WORLD);
+    
+    printf("\n\nLocal Result! \n");
+    for(int i = 0; i<  dim ; i++){
+        printf("%lf ",result_pt[i]);
+    }
+    printf("\n");
+    
+    // Gather all results
+    double *gather_results;
+    if(pid==baseProcessId) {
+        gather_results = (double *)malloc(dim*np*sizeof(double));
+    }
+    MPI_Gather( result_pt, dim, MPI_DOUBLE, gather_results, dim, MPI_DOUBLE, baseProcessId, MPI_COMM_WORLD); 
+
+    
+
+    
+    printf("\n");
+    if(pid==baseProcessId) {
+        int best_point = -1;
+        double min_distance = DBL_MAX;
+        printf("Below are the results gathered from all the processes.\n");
+        for(int i=0;i<np;i++) {
+            double current_result[dim]; 
+            for(int j=0;j<dim;j++) {
+                current_result[j] = gather_results[i*dim+j];
+                printf("%lf ", current_result[j]);
+            }
+            double distance = euclidean_distance(query_pt, current_result, dim);
+            printf(" , distance to query point is %lf", distance);
+            if(distance<min_distance) {
+                min_distance = distance;
+                best_point = i;
+            }
+            printf("\n"); 
+        }
+        printf("\nBest Point is:\n");
+        for(int i=0;i<dim;i++) {
+            printf("%lf ", gather_results[best_point*dim+i]);
+        }
+        
+    }
+    
+    printf("\n\nFin! \n");
+    //MPI_Barrier(MPI_COMM_WORLD);
+    
+    MPI_Finalize();
+    fclose(stdout);
+    return 0;
+}
